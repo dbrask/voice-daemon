@@ -1,0 +1,1 @@
+Quick check: the build is green and the daemon is up.

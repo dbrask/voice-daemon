@@ -1,0 +1,31 @@
+[Unit]
+Description=Desk satellite client (mic, speaker, face state)
+Documentation=file:%h/satellite/satellite/pi/kiosk.md
+After=network-online.target pipewire.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/satellite
+# Name the audio endpoints explicitly. Inheriting the default sink is how a test
+# run ended up audible on a sink captured by a multi-room streamer; on the Pi the
+# default is usually right, but "usually" is not a contract. List the real names
+# with `pw-cli ls Node | grep node.name` or `pactl list short sinks/sources`.
+Environment=SAT_SINK=alsa_output.platform-bcm2835_audio.stereo-fallback
+Environment=SAT_MIC=alsa_input.usb-default
+# The relay behind your TLS reverse proxy. Placeholder: set your own host.
+Environment=SAT_RELAY_URL=wss://relay.example.invalid/satellite/ws
+# Pi OS ships python3-aiohttp from apt; no venv, no wheels to build on ARM.
+ExecStart=/usr/bin/python3 -m satellite.client \
+    --relay ${SAT_RELAY_URL} \
+    --device desk \
+    --token-file %h/.config/satellite/token \
+    --sink ${SAT_SINK} \
+    --mic ${SAT_MIC}
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

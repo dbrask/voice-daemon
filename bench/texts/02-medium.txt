@@ -1,0 +1,1 @@
+The voice daemon loaded both engines in about twelve seconds. Whisper is resident in three gigabytes of VRAM, Chatterbox in another four, and there is still plenty of headroom for a small language model if we ever want one on the same card.

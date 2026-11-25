@@ -1,0 +1,5 @@
+# chatterbox-tts hard-pins torch==2.6.0 / torchaudio==2.6.0 (cu124), which has
+# no sm_120 kernels — it cannot run on this box's RTX 5070 Ti (Blackwell).
+# Override the pin to the cu128 wheels. Verified working: see README.
+torch==2.9.1
+torchaudio==2.9.1

@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Hermes TTS command-provider wrapper: text file in -> audio file out.
+#
+# Contract (tts.providers.gpu.command):
+#   hermes-tts {input_path} {output_path} {format} {voice}
+# format defaults to the output path's extension, then ogg. voice is optional;
+# it must be an id the daemon lists at GET /voices or the request is a 400.
+#
+# Exit codes: 0 ok, 1 daemon/HTTP error (one-line hint on stderr), 2 usage.
+# Talks to the warm voice daemon (systemd --user unit `voice-daemon`).
+set -euo pipefail
+
+VOICE_URL="${VOICE_URL:-http://127.0.0.1:9877}"
+VOICE_TIMEOUT="${VOICE_TIMEOUT:-300}"
+
+usage() { echo "usage: $(basename "$0") <input_text> <output_audio> [format] [voice]" >&2; exit 2; }
+
+[[ $# -ge 2 ]] || usage
+input="$1"
+output="$2"
+format="${3:-}"
+voice="${4:-}"
+
+[[ -f "$input" ]] || { echo "hermes-tts: no such file: $input" >&2; exit 1; }
+
+if [[ -z "$format" ]]; then
+  ext="${output##*.}"
+  case "$ext" in ogg|opus|wav) format="$ext" ;; *) format="ogg" ;; esac
+fi
+[[ "$format" == "opus" ]] && format="ogg"
+
+url="$VOICE_URL/tts?format=$format"
+[[ -n "$voice" ]] && url="$url&voice=$voice"
+
+mkdir -p "$(dirname "$output")"
+err="$(mktemp)"
+trap 'rm -f "$err"' EXIT
+
+if ! code="$(curl -sS -o "$output" -w '%{http_code}' \
+  --max-time "$VOICE_TIMEOUT" \
+  -X POST "$url" \
+  -H 'Content-Type: text/plain; charset=utf-8' \
+  --data-binary "@$input" 2>"$err")"; then
+  echo "hermes-tts: cannot reach voice daemon at $VOICE_URL ($(tr '\n' ' ' < "$err")) — start it with: systemctl --user start voice-daemon" >&2
+  rm -f "$output"
+  exit 1
+fi
+
+if [[ "$code" != "200" ]]; then
+  echo "hermes-tts: daemon returned HTTP $code: $(head -c 300 "$output" | tr '\n' ' ')" >&2
+  rm -f "$output"
+  exit 1
+fi
+
+[[ -s "$output" ]] || { echo "hermes-tts: daemon produced empty audio" >&2; rm -f "$output"; exit 1; }

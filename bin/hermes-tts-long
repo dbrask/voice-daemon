@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Long-form TTS: text file in -> one audio file per chapter, MEDIA: lines out.
+#
+#   hermes-tts-long [options] <input_text|->
+#
+# Submits the text to the warm voice daemon's POST /tts/long, polls the job to
+# completion, and prints one `MEDIA:<path>` line per chapter on stdout so a
+# Hermes reply can deliver them. Progress and a chapter index go to stderr.
+#
+# Chaptering is the daemon's: markdown `# headings` split the document
+# (`--split none` keeps it as one chapter). Extracted text (a PDF, a scraped
+# article) usually has no headings at all and would become one 40-minute file,
+# so `--auto-chapter [CHARS]` splits over-long chapters at paragraph boundaries
+# locally and posts the daemon's explicit `chapters` array instead. Nothing is
+# extracted here — the caller (Hermes) turns the PDF/EPUB/URL into text first;
+# the daemon only ever gets text.
+#
+# Chat-app voice bubbles cap around a minute, so a `[[audio_as_voice]]` line is
+# emitted only when EVERY chapter is at or under --voice-max-seconds (the
+# directive is message-global in Hermes: one long chapter and the whole message
+# would be pushed through the voice sender). Otherwise the chapters go as plain
+# audio files, which is what a book wants anyway.
+#
+# Exit codes: 0 ok, 1 daemon/HTTP/job error, 2 usage.
+set -euo pipefail
+
+VOICE_URL="${VOICE_URL:-http://127.0.0.1:9877}"
+VOICE_LONG_TIMEOUT="${VOICE_LONG_TIMEOUT:-1800}"   # whole job, seconds
+VOICE_LONG_POLL_S="${VOICE_LONG_POLL_S:-2}"
+VOICE_MAX_VOICE_S="${VOICE_MAX_VOICE_S:-60}"       # voice-bubble cutoff
+VOICE_AUTO_CHAPTER_CHARS="${VOICE_AUTO_CHAPTER_CHARS:-4000}"
+
+ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+
+usage() {
+  cat >&2 <<EOF
+usage: $(basename "$0") [options] <input_text|->
+
+  --voice ID              daemon voice id (GET /voices); default: daemon's
+  --split headings|none   chapter on markdown headings (default) or not
+  --auto-chapter [CHARS]  additionally split any chapter longer than CHARS
+                          (default $VOICE_AUTO_CHAPTER_CHARS) at paragraph breaks
+  --format ogg|wav        output container (default ogg)
+  --voice-max-seconds N   emit [[audio_as_voice]] only if every chapter is
+                          <= N seconds (default $VOICE_MAX_VOICE_S; 0 disables)
+  --timeout SECONDS       give up on the job after this long (default $VOICE_LONG_TIMEOUT)
+  --poll SECONDS          poll interval (default $VOICE_LONG_POLL_S)
+  --json                  print the final job snapshot instead of MEDIA: lines
+  --quiet                 no progress on stderr
+
+Env: VOICE_URL, VOICE_LONG_TIMEOUT, VOICE_LONG_POLL_S, VOICE_MAX_VOICE_S
+EOF
+  exit 2
+}
+
+command -v jq >/dev/null 2>&1 || { echo "hermes-tts-long: jq is required" >&2; exit 1; }
+
+input=""; voice=""; split=""; format="ogg"; as_json=0; quiet=0; auto_chapter=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --voice)             voice="${2:-}"; shift 2 ;;
+    --split)             split="${2:-}"; shift 2 ;;
+    --auto-chapter)
+      auto_chapter=1
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then VOICE_AUTO_CHAPTER_CHARS="$2"; shift 2; else shift; fi ;;
+    --format)            format="${2:-}"; shift 2 ;;
+    --voice-max-seconds) VOICE_MAX_VOICE_S="${2:-}"; shift 2 ;;
+    --timeout)           VOICE_LONG_TIMEOUT="${2:-}"; shift 2 ;;
+    --poll)              VOICE_LONG_POLL_S="${2:-}"; shift 2 ;;
+    --json)              as_json=1; shift ;;
+    --quiet)             quiet=1; shift ;;
+    -h|--help)           usage ;;
+    --) shift; input="${1:-}"; shift; break ;;
+    -*) echo "hermes-tts-long: unknown option $1" >&2; usage ;;
+    *)  [[ -z "$input" ]] || usage; input="$1"; shift ;;
+  esac
+done
+[[ -n "$input" ]] || usage
+
+say() { [[ "$quiet" -eq 1 ]] || echo "$*" >&2; }
+die() { echo "hermes-tts-long: $*" >&2; exit 1; }
+
+tmp="$(mktemp -d)"
+cleanup() { rm -rf "$tmp"; }
+trap cleanup EXIT
+
+text="$tmp/text"
+if [[ "$input" == "-" ]]; then
+  cat > "$text"
+else
+  [[ -f "$input" ]] || die "no such file: $input"
+  cp "$input" "$text"
+fi
+[[ -s "$text" ]] || die "empty input"
+
+url="$VOICE_URL/tts/long?format=$format"
+[[ -n "$voice" ]] && url="$url&voice=$voice"
+[[ -n "$split" ]] && url="$url&split=$split"
+
+body="$tmp/submit.json"
+if [[ "$auto_chapter" -eq 1 ]]; then
+  # Split locally into an explicit chapters array, then post that as JSON.
+  # `python3` here is only the stdlib + the repo's jobs.py; no engine import.
+  payload="$tmp/payload.json"
+  if ! python3 "$ROOT/scripts/chapterize.py" "$text" \
+        --split "${split:-headings}" --max-chars "$VOICE_AUTO_CHAPTER_CHARS" \
+        > "$payload" 2>"$tmp/err"; then
+    die "chapterize failed: $(tr '\n' ' ' < "$tmp/err")"
+  fi
+  say "auto-chaptered into $(jq -r '.chapters | length' "$payload") chapter(s) at <= $VOICE_AUTO_CHAPTER_CHARS chars"
+  submit_ctype='Content-Type: application/json'
+  submit_data="@$payload"
+else
+  submit_ctype='Content-Type: text/plain; charset=utf-8'
+  submit_data="@$text"
+fi
+
+if ! code="$(curl -sS -o "$body" -w '%{http_code}' --max-time 60 \
+      -X POST "$url" \
+      -H "$submit_ctype" \
+      --data-binary "$submit_data" 2>"$tmp/err")"; then
+  die "cannot reach voice daemon at $VOICE_URL ($(tr '\n' ' ' < "$tmp/err")) — start it with: systemctl --user start voice-daemon"
+fi
+if [[ "$code" != "202" ]]; then
+  die "submit returned HTTP $code: $(jq -r '.error // empty' "$body" 2>/dev/null || head -c 300 "$body")"
+fi
+
+job_id="$(jq -r '.job.id' "$body")"
+[[ -n "$job_id" && "$job_id" != "null" ]] || die "daemon returned no job id"
+chapters_total="$(jq -r '.job.progress.chapters_total' "$body")"
+chars_total="$(jq -r '.job.progress.chars_total' "$body")"
+say "job $job_id: $chapters_total chapter(s), $chars_total chars"
+
+# Ctrl-C / SIGTERM must not leave the GPU chewing on a book nobody is waiting for.
+cancel_job() {
+  curl -sS -m 10 -X POST "$VOICE_URL/jobs/$job_id/cancel" >/dev/null 2>&1 || true
+}
+trap 'cancel_job; cleanup; exit 130' INT TERM
+
+snap="$tmp/job.json"
+deadline=$(( $(date +%s) + VOICE_LONG_TIMEOUT ))
+last=""
+while :; do
+  if ! curl -sS -o "$snap" -m 30 "$VOICE_URL/jobs/$job_id" 2>/dev/null; then
+    say "poll failed, retrying"
+    sleep "$VOICE_LONG_POLL_S"; continue
+  fi
+  status="$(jq -r '.job.status // "gone"' "$snap")"
+  [[ "$status" == "gone" ]] && die "job $job_id disappeared from the daemon"
+  line="$(jq -r '"\(.job.progress.percent)% — chapter \(.job.progress.chapters_done)/\(.job.progress.chapters_total), \(.job.audio_s)s audio"' "$snap")"
+  [[ "$line" != "$last" ]] && { say "  $line"; last="$line"; }
+  case "$status" in
+    done)               break ;;
+    error)              die "job failed: $(jq -r '.job.error // "unknown error"' "$snap")" ;;
+    cancelled)          die "job was cancelled" ;;
+    queued|running)     ;;
+    *)                  die "unexpected job status: $status" ;;
+  esac
+  if (( $(date +%s) >= deadline )); then
+    cancel_job
+    die "job $job_id did not finish within ${VOICE_LONG_TIMEOUT}s (cancelled)"
+  fi
+  sleep "$VOICE_LONG_POLL_S"
+done
+
+if [[ "$as_json" -eq 1 ]]; then
+  jq '.job' "$snap"
+  exit 0
+fi
+
+# Chapter index on stderr (titles + durations), MEDIA: lines on stdout.
+jq -r '.job.chapters[] | "  \(.index). \(if .title == "" then "(untitled)" else .title end) — \(.audio_s)s"' "$snap" >&2
+
+longest="$(jq -r '[.job.chapters[].audio_s] | max // 0' "$snap")"
+if [[ "${VOICE_MAX_VOICE_S:-0}" != "0" ]] \
+   && awk -v a="$longest" -v b="$VOICE_MAX_VOICE_S" 'BEGIN{exit !(a<=b)}'; then
+  echo "[[audio_as_voice]]"
+else
+  say "longest chapter ${longest}s > ${VOICE_MAX_VOICE_S}s — sending as audio files, not voice bubbles"
+fi
+jq -r '.job.chapters[] | select(.path != null) | "MEDIA:" + .path' "$snap"
+
+total_s="$(jq -r '.job.audio_s' "$snap")"
+elapsed="$(jq -r '.job.elapsed_s' "$snap")"
+say "done: ${total_s}s of audio in ${elapsed}s (job $job_id)"

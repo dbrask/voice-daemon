@@ -1,0 +1,22 @@
+[Unit]
+Description=GPU voice daemon (STT/TTS provider for Hermes)
+Documentation=file:%h/repo/voice-daemon-public/README.md
+After=network.target
+
+# Example user unit. It assumes the checkout lives at ~/repo/voice-daemon-public
+# with its venv in .venv; adjust the paths if yours differ.
+[Service]
+Type=simple
+WorkingDirectory=%h/repo/voice-daemon-public
+EnvironmentFile=-%h/repo/voice-daemon-public/.env
+# CTranslate2 and torch fight over allocator fragmentation otherwise.
+Environment=PYTORCH_ALLOC_CONF=expandable_segments:True
+Environment=PYTHONPATH=%h/repo/voice-daemon-public
+ExecStart=%h/repo/voice-daemon-public/.venv/bin/python %h/repo/voice-daemon-public/voice_daemon.py
+Restart=on-failure
+RestartSec=5
+# Engines load at startup; first boot may pull weights from HF.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target

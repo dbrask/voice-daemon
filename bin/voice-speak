@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""Desk TTS: speak clipboard, stdin, or a file through the local voice daemon.
+
+Reads text from a file argument, piped stdin, or `wl-paste` (default when there
+is no input — including a Hyprland bind where stdin is /dev/null). Short text
+POSTs to /tts?format=wav; anything over 1500 characters goes through /tts/long
+and chapters play in order. Playback is `pw-play`, falling back to
+`ffplay -nodisp -autoexit`. `--stop` signals the voice-speak pid named in
+$XDG_RUNTIME_DIR/voice-speak.pid (and its PLAYER= child) after checking
+`/proc/<pid>/cmdline` contains `voice-speak`.
+
+Exit codes: 0 ok, 1 daemon/HTTP/play error (one-line hint on stderr), 2 usage.
+No daemon imports; stdlib only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+LONG_CHARS = 1500
+DEFAULT_URL = "http://127.0.0.1:9877"
+PID_NAME = "voice-speak.pid"
+
+# Signal handlers os._exit, so finally: blocks never run. Track these so
+# _on_term can unlink / kill them itself.
+_TMP: str | None = None
+_JOB: str | None = None
+_PLAYER: subprocess.Popen | None = None
+
+
+def route_for(text: str) -> str:
+    return "/tts/long" if len(text) > LONG_CHARS else "/tts"
+
+
+def build_url(base: str, path: str, voice: str = "") -> str:
+    query = {"format": "wav"}
+    if voice:
+        query["voice"] = voice
+    return f"{base.rstrip('/')}{path}?{urllib.parse.urlencode(query)}"
+
+
+def resolve_text(*, file_arg, stdin_isatty, stdin_read, paste) -> str:
+    if file_arg:
+        path = Path(file_arg)
+        if not path.is_file():
+            raise FileNotFoundError(file_arg)
+        return path.read_text(encoding="utf-8")
+    if stdin_isatty:
+        return paste()
+    data = stdin_read()
+    if data:
+        return data
+    return paste()
+
+
+def player_argv(which=shutil.which) -> list[str]:
+    if which("pw-play"):
+        return ["pw-play"]
+    if which("ffplay"):
+        return ["ffplay", "-nodisp", "-autoexit"]
+    raise RuntimeError("no player: install pw-play (pipewire) or ffplay (ffmpeg)")
+
+
+def pidfile_path(runtime_dir: str | None = None) -> Path:
+    root = runtime_dir or os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    return Path(root) / PID_NAME
+
+
+def _one_line(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def paste_clipboard() -> str:
+    exe = shutil.which("wl-paste")
+    if not exe:
+        raise RuntimeError("wl-paste not found (needed to read the Wayland clipboard)")
+    proc = subprocess.run([exe], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(_one_line(proc.stderr or "wl-paste failed"))
+    return proc.stdout
+
+
+class SpeakError(Exception):
+    """User-facing failure; message already one line."""
+
+
+class Interrupted(Exception):
+    """Playback stopped by --stop or a signal on the player."""
+
+
+def _notify(msg: str) -> None:
+    exe = shutil.which("notify-send")
+    if not exe:
+        return
+    subprocess.run([exe, "-u", "critical", "voice-speak", msg], check=False,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def die(msg: str, code: int = 1) -> None:
+    line = _one_line(msg)
+    print(f"voice-speak: {line}", file=sys.stderr)
+    _notify(line)
+    raise SystemExit(code)
+
+
+def stop_playback(pidfile: Path | None = None, url: str | None = None) -> None:
+    pf = pidfile or pidfile_path()
+    if not pf.is_file():
+        return
+    lines = pf.read_text(encoding="utf-8").splitlines()
+    job = None
+    pid = None
+    player = None
+    if lines:
+        try:
+            pid = int(lines[0].strip())
+        except ValueError:
+            pid = None
+        for line in lines[1:]:
+            if line.startswith("JOB="):
+                job = line[4:].strip() or None
+            elif line.startswith("PLAYER="):
+                try:
+                    player = int(line[7:].strip())
+                except ValueError:
+                    player = None
+    if pid is None or not _is_voice_speak_pid(pid):
+        _unlink(pf)
+        return
+    if job and url:
+        try:
+            urllib.request.urlopen(
+                urllib.request.Request(f"{url.rstrip('/')}/jobs/{job}/cancel", method="POST"),
+                timeout=5,
+            )
+        except OSError:
+            pass
+    if player is not None and pid is not None and _player_belongs_to(pid, player):
+        _kill_pid(player)
+    _kill_pid(pid)
+    _unlink(pf)
+
+
+def _is_voice_speak_pid(pid: int) -> bool:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return b"voice-speak" in raw
+
+
+def _player_belongs_to(parent_pid: int, player: int) -> bool:
+    """True iff /proc/<player>/stat ppid is the voice-speak pid.
+
+    Guards a stale PLAYER= line (player exited between chapters, pid reused)
+    from SIGTERM-ing an unrelated process.
+    """
+    try:
+        raw = Path(f"/proc/{player}/stat").read_bytes()
+    except OSError:
+        return False
+    rparen = raw.rfind(b")")
+    if rparen < 0:
+        return False
+    fields = raw[rparen + 2 :].split()
+    try:
+        return int(fields[1]) == parent_pid
+    except (IndexError, ValueError):
+        return False
+
+
+def _unlink(path: Path | str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _kill_pid(pid: int) -> None:
+    # Direct kill only — never killpg. We stay in the shell's process group so
+    # pipeline Ctrl-C reaches us; killpg would take the whole foreground group.
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    deadline = time.monotonic() + 0.35
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.02)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        return
+    deadline = time.monotonic() + 0.35
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.02)
+
+
+def _write_pidfile(pf: Path) -> None:
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    body = f"{os.getpid()}\n"
+    if _JOB:
+        body += f"JOB={_JOB}\n"
+    if _PLAYER is not None and _PLAYER.pid:
+        body += f"PLAYER={_PLAYER.pid}\n"
+    pf.write_text(body, encoding="utf-8")
+
+
+def _cleanup_runtime() -> None:
+    global _TMP
+    if _TMP:
+        _unlink(_TMP)
+        _TMP = None
+    _unlink(pidfile_path())
+
+
+def _kill_player() -> None:
+    proc = _PLAYER
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    deadline = time.monotonic() + 0.35
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return
+        time.sleep(0.02)
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _on_term(signum, _frame) -> None:
+    _cleanup_runtime()
+    _kill_player()
+    os._exit(128 + signum)
+
+
+def _http(url: str, data: bytes | None = None, timeout: float = 30):
+    headers = {}
+    method = "GET"
+    if data is not None:
+        method = "POST"
+        headers["Content-Type"] = "text/plain; charset=utf-8"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        return urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        body = _one_line(exc.read()[:300].decode("utf-8", "replace"))
+        raise SpeakError(f"daemon returned HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        reason = _one_line(getattr(exc, "reason", exc))
+        base = url.split("/tts")[0].split("/jobs")[0]
+        raise SpeakError(
+            f"cannot reach voice daemon at {base} ({reason}) — "
+            "start it with: systemctl --user start voice-daemon"
+        ) from exc
+    except OSError as exc:
+        base = url.split("/tts")[0].split("/jobs")[0]
+        raise SpeakError(
+            f"cannot reach voice daemon at {base} ({_one_line(exc)}) — "
+            "start it with: systemctl --user start voice-daemon"
+        ) from exc
+
+
+def _play(path: str) -> None:
+    global _PLAYER
+    argv = player_argv() + [path]
+    proc = subprocess.Popen(argv)
+    _PLAYER = proc
+    _write_pidfile(pidfile_path())
+    rc = proc.wait()
+    _PLAYER = None
+    if rc == 0:
+        return
+    if rc in (-signal.SIGTERM, -signal.SIGKILL, -signal.SIGINT):
+        raise Interrupted
+    raise SpeakError(f"player exited {rc}")
+
+
+def _speak_short(url: str, text: str, timeout: float) -> None:
+    global _TMP
+    with _http(url, data=text.encode("utf-8"), timeout=timeout) as resp:
+        audio = resp.read()
+    if not audio:
+        raise SpeakError("daemon produced empty audio")
+    fd, tmp = tempfile.mkstemp(prefix="voice-speak-", suffix=".wav")
+    os.close(fd)
+    _TMP = tmp
+    try:
+        Path(tmp).write_bytes(audio)
+        _play(tmp)
+    finally:
+        _TMP = None
+        _unlink(tmp)
+
+
+def _speak_long(url: str, text: str, timeout: float, poll_s: float, pidfile: Path, base: str) -> None:
+    global _JOB
+    with _http(url, data=text.encode("utf-8"), timeout=min(timeout, 60)) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    job = payload.get("job") or {}
+    job_id = job.get("id")
+    if not job_id:
+        raise SpeakError("daemon returned no job id")
+    _JOB = job_id
+    _write_pidfile(pidfile)
+    snap_url = f"{base.rstrip('/')}/jobs/{job_id}"
+    deadline = time.monotonic() + timeout
+    played: list[str] = []
+    while time.monotonic() < deadline:
+        with _http(snap_url, timeout=30) as resp:
+            snap = json.loads(resp.read().decode("utf-8"))
+        job = snap.get("job") or {}
+        status = job.get("status") or "gone"
+        if status == "gone":
+            raise SpeakError(f"job {job_id} disappeared from the daemon")
+        for chapter in job.get("chapters") or []:
+            path = chapter.get("path")
+            if path and path not in played:
+                _play(path)
+                played.append(path)
+        if status == "done":
+            return
+        if status == "error":
+            raise SpeakError(f"job failed: {job.get('error') or 'unknown error'}")
+        if status == "cancelled":
+            raise SpeakError("job was cancelled")
+        time.sleep(poll_s)
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(f"{base.rstrip('/')}/jobs/{job_id}/cancel", method="POST"),
+            timeout=5,
+        )
+    except OSError:
+        pass
+    raise SpeakError(f"job {job_id} did not finish within {int(timeout)}s (cancelled)")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="voice-speak",
+        add_help=True,
+        description="Speak clipboard/stdin/file through the local voice daemon.",
+    )
+    parser.add_argument("--voice", default="", help="daemon voice id (GET /voices)")
+    parser.add_argument("--stop", action="store_true", help="kill running playback")
+    parser.add_argument("file", nargs="?", help="text file (default: stdin, else clipboard)")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        raise SystemExit(exc.code if isinstance(exc.code, int) else 2) from exc
+
+    base = os.environ.get("VOICE_URL", DEFAULT_URL)
+    timeout = float(os.environ.get("VOICE_TIMEOUT", "300"))
+    poll_s = float(os.environ.get("VOICE_LONG_POLL_S", "0.4"))
+    pf = pidfile_path()
+
+    if args.stop:
+        stop_playback(pf, url=base)
+        return 0
+
+    try:
+        text = resolve_text(
+            file_arg=args.file,
+            stdin_isatty=sys.stdin.isatty(),
+            stdin_read=sys.stdin.read,
+            paste=paste_clipboard,
+        )
+    except FileNotFoundError as exc:
+        die(f"no such file: {exc}")
+    except RuntimeError as exc:
+        die(str(exc))
+
+    if not text or not text.strip():
+        die("empty input")
+
+    stop_playback(pf, url=base)
+    signal.signal(signal.SIGTERM, _on_term)
+    # SIGINT stays at Python's default so Ctrl-C in a pipeline (echo | voice-speak)
+    # becomes KeyboardInterrupt. setpgrp is intentionally not used: it moved us
+    # out of the tty foreground group, so the shell's SIGINT never arrived.
+    _write_pidfile(pf)
+
+    path = route_for(text)
+    url = build_url(base, path, voice=args.voice)
+    try:
+        if path == "/tts/long":
+            _speak_long(url, text, timeout=timeout, poll_s=poll_s, pidfile=pf, base=base)
+        else:
+            _speak_short(url, text, timeout=timeout)
+    except SpeakError as exc:
+        die(str(exc))
+    except RuntimeError as exc:
+        die(str(exc))
+    except Interrupted:
+        _cleanup_runtime()
+        _kill_player()
+        return 143
+    except KeyboardInterrupt:
+        _cleanup_runtime()
+        _kill_player()
+        return 130
+    finally:
+        _unlink(pf)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

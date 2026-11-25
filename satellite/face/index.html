@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<!--
+  v0 indicator: coloured circle + state word + caption. The character face is
+  a later card; the contract this page implements is the SSE stream from the
+  satellite client, so a richer face is one new index.html against the same
+  six states + mood. This page holds no token and talks only to loopback.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>desk satellite</title>
+<style>
+  :root { --dot: #3b4252; --glow: 0 0 0 rgba(0,0,0,0); }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: #14161c; color: #d8dee9; cursor: pointer; user-select: none;
+    font: 400 1.1rem/1.4 system-ui, -apple-system, "DejaVu Sans", sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    justify-content: center; gap: 2.2rem; padding: 2rem; text-align: center;
+  }
+  #dot {
+    width: 42vmin; height: 42vmin; border-radius: 50%;
+    background: var(--dot); box-shadow: var(--glow);
+    transition: background .25s ease, box-shadow .25s ease, transform .25s ease;
+  }
+  #state { font-size: 1.5rem; letter-spacing: .18em; text-transform: uppercase; opacity: .75; }
+  #caption { max-width: 34ch; min-height: 3em; opacity: .6; font-size: 1.05rem; }
+  #mood { position: fixed; bottom: .8rem; right: 1rem; font-size: .75rem; opacity: .3; }
+
+  /* state -> colour + animation. CSS keyframes only: no JS animation loop,
+     which keeps the Pi 5 GPU doing the work. */
+  .idle      #dot { background: #4c566a; animation: blink 4.5s ease-in-out infinite; }
+  .listening #dot { background: #a3be8c; animation: pulse 1.2s ease-in-out infinite; }
+  .thinking  #dot { background: #81a1c1; animation: drift 2s ease-in-out infinite; }
+  .speaking  #dot { background: #88c0d0; animation: talk .42s ease-in-out infinite; }
+  .error     #dot { background: #bf616a; animation: none; }
+  .offline   #dot { background: #2e3440; animation: none; opacity: .5; }
+
+  /* mood is orthogonal to state: an expression, not a phase. */
+  .mood-happy     #dot { filter: saturate(1.35) brightness(1.1); }
+  .mood-curious   #dot { filter: hue-rotate(-18deg); }
+  .mood-concerned #dot { filter: saturate(.7) brightness(.85); }
+  .mood-playful   #dot { filter: saturate(1.5) hue-rotate(14deg); }
+
+  @keyframes blink { 0%,92%,100% { transform: scale(1); } 96% { transform: scale(.94); } }
+  @keyframes pulse { 0%,100% { transform: scale(1); box-shadow: 0 0 0 0 #a3be8c55; }
+                     50% { transform: scale(1.05); box-shadow: 0 0 6vmin 2vmin #a3be8c22; } }
+  @keyframes drift { 0%,100% { transform: translateX(-1.5vmin); } 50% { transform: translateX(1.5vmin); } }
+  @keyframes talk  { 0%,100% { transform: scaleY(1); } 50% { transform: scaleY(.88); } }
+  @media (prefers-reduced-motion: reduce) { #dot { animation: none !important; } }
+</style>
+</head>
+<body class="offline">
+  <div id="dot"></div>
+  <div id="state">offline</div>
+  <div id="caption"></div>
+  <div id="mood">neutral</div>
+<script>
+const STATES = ["idle", "listening", "thinking", "speaking", "error", "offline"];
+const MOODS  = ["neutral", "happy", "curious", "concerned", "playful"];
+const $state = document.getElementById("state");
+const $caption = document.getElementById("caption");
+const $mood = document.getElementById("mood");
+
+function render(ev) {
+  const state = STATES.includes(ev.state) ? ev.state : "offline";
+  const mood  = MOODS.includes(ev.mood) ? ev.mood : "neutral";
+  document.body.className = `${state} mood-${mood}`;
+  $state.textContent = state;
+  $caption.textContent = ev.text || "";
+  $mood.textContent = mood;
+}
+
+// The client is the only source of state; a dropped SSE stream means the face
+// no longer knows anything, so it shows offline until EventSource reconnects.
+function connect() {
+  const es = new EventSource("/events");
+  es.onmessage = (e) => { try { render(JSON.parse(e.data)); } catch (_) {} };
+  es.onerror = () => { render({ state: "offline", mood: "neutral", text: "" }); };
+}
+connect();
+
+async function tap() {
+  try { await fetch("/tap", { method: "POST" }); } catch (_) {}
+}
+document.body.addEventListener("pointerdown", tap);
+document.addEventListener("keydown", (e) => {
+  if (e.code === "Space" || e.code === "Enter") { e.preventDefault(); tap(); }
+});
+</script>
+</body>
+</html>

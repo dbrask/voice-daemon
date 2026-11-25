@@ -1,0 +1,27 @@
+# CUDA 12.8 wheels — required for Blackwell (RTX 50xx, sm_120).
+# Install with the override file, which breaks chatterbox's torch==2.6.0 pin:
+#   uv pip install -r requirements.txt --override overrides.txt
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+torch
+torchaudio
+faster-whisper
+aiohttp
+chatterbox-tts
+# Kokoro-82M: the long-form reading engine (TTS_ENGINE=kokoro). Does not pin
+# torch, so it leaves the cu128 wheels above alone. misaki[en] is its English
+# G2P; espeak-ng (system package) is only the out-of-dictionary fallback.
+kokoro
+misaki[en]
+# perth (a chatterbox dep) imports pkg_resources; setuptools >= 81 removed it.
+# The engine falls back to the no-op watermarker, but keeping setuptools around
+# lets the real one load where it can.
+setuptools
+# Piper (TTS_ENGINE=piper), the zero-VRAM CPU fallback, adds NOTHING here. Its
+# runtime is onnxruntime (already above via kokoro's stack, and CPU-only on this
+# box) plus phonemizer + espeakng_loader (misaki's deps). Depending on the
+# `piper-tts` package would vendor a second onnxruntime and phonemizer pin into
+# a venv whose torch is already pinned to cu128, so engines/piper.py implements
+# the ~40 lines of Piper inference directly instead. Voices are data, not a
+# package: drop NAME.onnx + NAME.onnx.json in ~/piper-voices (PIPER_VOICE_DIR),
+# from https://huggingface.co/rhasspy/piper-voices

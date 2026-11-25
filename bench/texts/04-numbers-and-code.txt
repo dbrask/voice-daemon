@@ -1,0 +1,1 @@
+The API returns HTTP 429 when you exceed 60 requests per minute, so set VOICE_TIMEOUT to 300 and retry with exponential backoff: 1s, 2s, 4s, up to 32s. The config file lives at ~/.hermes/config.yaml and the port is 9877.

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Mint a per-device satellite token.
+#
+# Prints the plaintext token ONCE (copy it to the Pi at
+# ~/.config/satellite/token, mode 600) and appends "<device> <sha256>" to the
+# relay's tokens file. The relay only ever sees the digest.
+#
+#   scripts/satellite-token desk
+#   scripts/satellite-token desk --replace     # drop any existing line first
+set -euo pipefail
+
+TOKENS_FILE="${SAT_TOKENS_FILE:-$HOME/.config/voice-bot/satellite-tokens}"
+# Same rule as the relay: a leading ~ (as written in .env) means $HOME.
+case "$TOKENS_FILE" in "~/"*) TOKENS_FILE="$HOME/${TOKENS_FILE#\~/}" ;; esac
+
+usage() { echo "usage: $(basename "$0") <device> [--replace] [--write-local]" >&2; exit 2; }
+
+device="${1:-}"
+[ -n "$device" ] || usage
+shift
+replace=0
+write_local=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --replace) replace=1 ;;
+    # Dev on the relay host: also drop the plaintext into the client's own token file
+    # instead of printing it for a copy-paste. Do not use for a real Pi.
+    --write-local) write_local=1 ;;
+    *) usage ;;
+  esac
+  shift
+done
+
+if ! printf '%s' "$device" | grep -Eq '^[a-z0-9][a-z0-9-]{0,30}$'; then
+  echo "device must be lowercase alnum/dash, 1-31 chars (it lands in the session id)" >&2
+  exit 2
+fi
+
+mkdir -p "$(dirname "$TOKENS_FILE")"
+touch "$TOKENS_FILE"
+chmod 600 "$TOKENS_FILE"
+
+if grep -q "^${device}[[:space:]]" "$TOKENS_FILE" 2>/dev/null; then
+  if [ "$replace" -eq 0 ]; then
+    echo "device '$device' already has a token in $TOKENS_FILE; pass --replace to rotate it" >&2
+    exit 1
+  fi
+  tmp="$(mktemp)"
+  grep -v "^${device}[[:space:]]" "$TOKENS_FILE" > "$tmp" || true
+  cat "$tmp" > "$TOKENS_FILE"
+  rm -f "$tmp"
+fi
+
+token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+digest="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+printf '%s %s\n' "$device" "$digest" >> "$TOKENS_FILE"
+
+if [ "$write_local" -eq 1 ]; then
+  local_file="${SAT_TOKEN_FILE:-$HOME/.config/satellite/token}"
+  mkdir -p "$(dirname "$local_file")"
+  printf '%s' "$token" > "$local_file"
+  chmod 600 "$local_file"
+  cat <<EOF
+device:  $device
+token:   written to $local_file (mode 600), not printed
+
+Digest appended to $TOKENS_FILE. Restart the relay to pick it up:
+  systemctl --user restart satellite-relay
+EOF
+  exit 0
+fi
+
+cat <<EOF
+device:  $device
+token:   $token
+
+Shown once. On the Pi:
+  mkdir -p ~/.config/satellite
+  printf '%s' '<the token above>' > ~/.config/satellite/token
+  chmod 600 ~/.config/satellite/token
+
+Digest appended to $TOKENS_FILE. Restart the relay to pick it up:
+  systemctl --user restart satellite-relay
+EOF

@@ -1,0 +1,23 @@
+[Unit]
+Description=Desk satellite relay (Pi <-> voice daemon + Hermes)
+Documentation=file:%h/repo/voice-daemon-public/README.md
+# The relay talks to the daemon over HTTP like any other client, so it does not
+# need the daemon up to start and a daemon restart does not drop the socket.
+After=network-online.target voice-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/repo/voice-daemon-public
+EnvironmentFile=%h/repo/voice-daemon-public/.env
+ExecStart=%h/repo/voice-daemon-public/.venv/bin/python -m satellite.relay
+Restart=on-failure
+RestartSec=3
+# Loopback bind only; publish it through a TLS reverse proxy, never directly.
+PrivateTmp=yes
+NoNewPrivileges=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

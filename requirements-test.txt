@@ -1,0 +1,7 @@
+# Unit-test dependencies only: no GPU, no torch, no model downloads.
+#   uv venv .venv-test && VIRTUAL_ENV=.venv-test uv pip install -r requirements-test.txt
+#   .venv-test/bin/python -m unittest discover -s tests
+# System tools the tests shell out to: ffmpeg, curl, jq (bash wrappers).
+aiohttp
+numpy
+onnxruntime

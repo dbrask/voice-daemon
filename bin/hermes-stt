@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Hermes STT command-provider wrapper: audio in -> transcript out.
+#
+# Contract (stt.providers.gpu.command):
+#   hermes-stt {input_path} {output_path} {language}
+# output_path and language are optional. The transcript is written to
+# output_path when given and always echoed to stdout (Hermes accepts either).
+#
+# Exit codes: 0 ok, 1 daemon/HTTP error (one-line hint on stderr), 2 usage.
+# Talks to the warm voice daemon (systemd --user unit `voice-daemon`).
+set -euo pipefail
+
+VOICE_URL="${VOICE_URL:-http://127.0.0.1:9877}"
+VOICE_TIMEOUT="${VOICE_TIMEOUT:-300}"
+
+usage() { echo "usage: $(basename "$0") <input_audio> [output_txt] [language]" >&2; exit 2; }
+
+[[ $# -ge 1 ]] || usage
+input="$1"
+output="${2:-}"
+language="${3:-}"
+
+[[ -f "$input" ]] || { echo "hermes-stt: no such file: $input" >&2; exit 1; }
+
+url="$VOICE_URL/stt"
+if [[ -n "$language" && "$language" != "auto" ]]; then
+  url="$url?language=$language"
+fi
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+
+if ! code="$(curl -sS -o "$tmp" -w '%{http_code}' \
+  --max-time "$VOICE_TIMEOUT" \
+  -X POST "$url" \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary "@$input" 2>/dev/null)"; then
+  echo "hermes-stt: cannot reach voice daemon at $VOICE_URL — start it with: systemctl --user start voice-daemon" >&2
+  exit 1
+fi
+
+if [[ "$code" != "200" ]]; then
+  echo "hermes-stt: daemon returned HTTP $code: $(head -c 300 "$tmp" | tr '\n' ' ')" >&2
+  exit 1
+fi
+
+text="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["text"])' "$tmp")"
+
+if [[ -n "$output" ]]; then
+  printf '%s' "$text" > "$output"
+fi
+printf '%s\n' "$text"
